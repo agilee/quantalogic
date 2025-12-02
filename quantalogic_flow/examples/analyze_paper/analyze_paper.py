@@ -21,6 +21,7 @@ import subprocess
 from pathlib import Path
 from typing import Annotated, List, Union
 
+import litellm
 import pyperclip
 import typer
 from loguru import logger
@@ -32,6 +33,154 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from quantalogic_flow import Nodes, Workflow
+
+
+# =============================================================================
+# DUCK-TYPING: Make poe/ models appear as vision models to litellm
+# =============================================================================
+# POE API supports vision-capable models like Claude-Sonnet-4.5, but litellm
+# doesn't recognize them because poe/ is not in its model registry.
+# We monkey-patch litellm.supports_vision to return True for known poe/ vision models.
+
+# List of POE models known to support vision
+# Note: GPT-4o is recommended over Claude for PDF extraction as Claude
+# models via POE can trigger content filtering policies on some documents.
+POE_VISION_MODELS = [
+    "poe/GPT-4o",  # Recommended - less aggressive content filtering
+    "poe/GPT-4o-Mini",
+    "poe/GPT-4-Turbo",
+    "poe/Claude-Sonnet-4.5",  # May trigger content filtering on some PDFs
+    "poe/Claude-3.5-Sonnet",
+    "poe/Claude-3-Opus",
+    "poe/Gemini-1.5-Pro",
+    "poe/Gemini-1.5-Flash",
+    "poe/Gemini-2.0-Flash",
+    # Add more POE vision models as needed
+]
+
+# POE API Configuration
+POE_API_BASE = "https://api.poe.com/v1"
+
+# Track converted POE models (original -> converted) for vision validation
+_converted_poe_models = set()
+
+
+def _is_poe_vision_model(model: str) -> bool:
+    """Check if a model is a known POE vision model."""
+    if not model.startswith("poe/"):
+        return False
+    
+    # Check if it's in our known list (case-insensitive comparison)
+    model_lower = model.lower()
+    for poe_model in POE_VISION_MODELS:
+        if model_lower == poe_model.lower():
+            return True
+    
+    # For unknown poe/ models, assume they support vision if they contain
+    # known vision-capable model names
+    vision_keywords = ["claude", "gpt-4", "gemini", "opus", "sonnet"]
+    return any(kw in model_lower for kw in vision_keywords)
+
+
+def _is_converted_poe_model(model: str) -> bool:
+    """Check if a model was converted from a POE model."""
+    return model in _converted_poe_models
+
+
+# Store the original functions
+_original_supports_vision = litellm.supports_vision
+_original_validate_environment = litellm.validate_environment
+_original_check_valid_key = litellm.check_valid_key
+
+
+def _patched_supports_vision(model: str, custom_llm_provider: str = None) -> bool:
+    """
+    Patched version of litellm.supports_vision that recognizes POE vision models.
+    """
+    # Check for original POE models
+    if _is_poe_vision_model(model):
+        logger.debug(f"Duck-typed POE model '{model}' as vision-capable")
+        return True
+    
+    # Check for converted POE models (openai/X format after conversion)
+    if _is_converted_poe_model(model):
+        logger.debug(f"Duck-typed converted POE model '{model}' as vision-capable")
+        return True
+    
+    return _original_supports_vision(model, custom_llm_provider)
+
+
+def _patched_validate_environment(model: str, **kwargs) -> dict:
+    """
+    Patched version of litellm.validate_environment that recognizes POE models.
+    """
+    # Handle both original poe/ models and converted openai/ models
+    if model.startswith("poe/") or _is_converted_poe_model(model):
+        # For POE models, check if POE_API_KEY is set
+        poe_key = os.environ.get("POE_API_KEY")
+        if poe_key:
+            logger.debug(f"POE environment validated for model '{model}'")
+            return {"keys_in_environment": True, "missing_keys": []}
+        else:
+            return {"keys_in_environment": False, "missing_keys": ["POE_API_KEY"]}
+    return _original_validate_environment(model, **kwargs)
+
+
+def _patched_check_valid_key(model: str, api_key: str = None, **kwargs) -> bool:
+    """
+    Patched version of litellm.check_valid_key that recognizes POE models.
+    For POE models, we assume the key is valid if POE_API_KEY env var is set.
+    """
+    # Handle both original poe/ models and converted openai/ models
+    if model.startswith("poe/") or _is_converted_poe_model(model):
+        poe_key = api_key or os.environ.get("POE_API_KEY")
+        if poe_key:
+            logger.debug(f"POE API key validated for model '{model}'")
+            return True
+        return False
+    return _original_check_valid_key(model, api_key, **kwargs)
+
+
+def convert_poe_model_for_litellm(model: str) -> tuple:
+    """
+    Convert a POE model string to litellm-compatible format.
+    
+    Returns:
+        tuple: (converted_model, extra_kwargs) where extra_kwargs contains
+               api_base and api_key if needed.
+    """
+    if not model.startswith("poe/"):
+        return model, {}
+    
+    # Extract the actual model name (remove 'poe/' prefix)
+    actual_model = model[4:]
+    
+    # Convert to OpenAI-compatible format for litellm
+    converted_model = f"openai/{actual_model}"
+    
+    # Register the converted model so supports_vision returns True for it
+    _converted_poe_models.add(converted_model)
+    
+    # Build extra kwargs for the API call
+    extra_kwargs = {
+        "api_base": POE_API_BASE,
+    }
+    
+    # Add API key if available
+    poe_key = os.environ.get("POE_API_KEY")
+    if poe_key:
+        extra_kwargs["api_key"] = poe_key
+    
+    logger.info(f"Converted POE model '{model}' to '{converted_model}' with api_base={POE_API_BASE}")
+    return converted_model, extra_kwargs
+
+
+# Apply the monkey-patches
+litellm.supports_vision = _patched_supports_vision
+litellm.validate_environment = _patched_validate_environment
+litellm.check_valid_key = _patched_check_valid_key
+logger.info("Applied litellm monkey-patches for POE vision models")
+# =============================================================================
 
 
 def check_poppler():
@@ -51,13 +200,15 @@ app = typer.Typer(help="Convert a file (PDF, text, or Markdown) to a LinkedIn po
 console = Console()
 
 # Default models for different phases (updated to correct Gemini models)
-DEFAULT_TEXT_EXTRACTION_MODEL = "gemini/gemini-2.5-flash-lite"
+#DEFAULT_TEXT_EXTRACTION_MODEL = "gemini/gemini-2.5-flash-lite"
+DEFAULT_TEXT_EXTRACTION_MODEL = "poe/GPT-5-mini"  # GPT-4o has less aggressive content filtering than Claude
 #DEFAULT_TEXT_EXTRACTION_MODEL = "gemini/Gemini-2.5-flash"
 
-DEFAULT_CLEANING_MODEL = "gemini/gemini-2.5-flash"
+#DEFAULT_CLEANING_MODEL = "gemini/gemini-2.5-flash"
+DEFAULT_CLEANING_MODEL = "poe/GPT-5-mini"
 #DEFAULT_WRITING_MODEL = "deepseek/deepseek-reasoner"
 #DEFAULT_WRITING_MODEL = "openrouter/openai/gpt-4o-mini"
-DEFAULT_WRITING_MODEL = "poe/Claude-Sonnet-4.5"
+DEFAULT_WRITING_MODEL = "poe/Gemini-3-Pro"
 
 # Define a Pydantic model for structured output of title and authors
 class PaperInfo(BaseModel):
@@ -133,13 +284,17 @@ async def convert_pdf_to_markdown(
         )
 
     try:
-        logger.info(f"Calling zerox with model: {model}, file: {file_path}")
+        # Handle POE models - convert to OpenAI format with POE API base
+        model_to_use, extra_kwargs = convert_poe_model_for_litellm(model)
+        
+        logger.info(f"Calling zerox with model: {model_to_use}, file: {file_path}")
         zerox_result = await zerox(
             file_path=file_path,
-            model=model,
+            model=model_to_use,
             system_prompt=custom_system_prompt,
             output_dir=output_dir,
-            select_pages=select_pages
+            select_pages=select_pages,
+            **extra_kwargs  # Pass api_base and api_key for POE models
         )
 
         markdown_content = ""
